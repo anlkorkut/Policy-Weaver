@@ -24,6 +24,9 @@ class _FakeLogger:
     def warning(self, message):
         self.warnings.append(message)
 
+    def debug(self, message):
+        return None
+
 
 class TestDataversePermissionObjectResolution(unittest.TestCase):
     def setUp(self):
@@ -63,23 +66,116 @@ class TestDataversePermissionObjectResolution(unittest.TestCase):
         self.assertEqual("entra-obj-2", resolved[0].entra_object_id)
         self.assertEqual(IamType.USER, resolved[0].type)
 
-    def test_aad_backed_team_returns_group_object(self):
+    def test_application_user_returns_service_principal_object(self):
+        user = DataverseUser(
+            id="application-user-1",
+            name="Integration App",
+            azure_ad_object_id="entra-app-object-1",
+            application_id="app-registration-1",
+        )
+        self.client.environment = _FakeEnvironment(users=[user])
+
+        resolved = self.client.__resolve_permission_object__(
+            "application-user-1", IamType.USER
+        )
+
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(IamType.SERVICE_PRINCIPAL, resolved[0].type)
+        self.assertEqual("entra-app-object-1", resolved[0].entra_object_id)
+
+    def test_application_user_without_entra_id_uses_app_id_for_graph_lookup(self):
+        user = DataverseUser(
+            id="application-user-2",
+            name="Legacy Integration App",
+            azure_ad_object_id=None,
+            application_id="app-registration-2",
+            access_mode=4,
+        )
+        self.client.environment = _FakeEnvironment(users=[user])
+
+        resolved = self.client.__resolve_permission_object__(
+            "application-user-2", IamType.USER
+        )
+
+        self.assertEqual(1, len(resolved))
+        self.assertEqual(IamType.SERVICE_PRINCIPAL, resolved[0].type)
+        self.assertIsNone(resolved[0].entra_object_id)
+        self.assertIsNone(resolved[0].id)
+        self.assertEqual("app-registration-2", resolved[0].app_id)
+
+    def test_administrative_user_is_not_mapped_to_fabric_data_access(self):
+        user = DataverseUser(
+            id="admin-user-1",
+            email="admin@example.com",
+            azure_ad_object_id="entra-admin-1",
+            access_mode=1,
+            is_licensed=True,
+        )
+        self.client.environment = _FakeEnvironment(users=[user])
+
+        resolved = self.client.__resolve_permission_object__(
+            "admin-user-1", IamType.USER
+        )
+
+        self.assertEqual([], resolved)
+
+    def test_unlicensed_interactive_user_is_not_mapped(self):
+        user = DataverseUser(
+            id="unlicensed-user-1",
+            email="user@example.com",
+            azure_ad_object_id="entra-user-1",
+            access_mode=0,
+            is_licensed=False,
+        )
+        self.client.environment = _FakeEnvironment(users=[user])
+
+        resolved = self.client.__resolve_permission_object__(
+            "unlicensed-user-1", IamType.USER
+        )
+
+        self.assertEqual([], resolved)
+
+    def test_unlicensed_noninteractive_user_remains_mappable(self):
+        user = DataverseUser(
+            id="noninteractive-user-1",
+            email="service@example.com",
+            azure_ad_object_id="entra-service-1",
+            access_mode=4,
+            is_licensed=False,
+        )
+        self.client.environment = _FakeEnvironment(users=[user])
+
+        resolved = self.client.__resolve_permission_object__(
+            "noninteractive-user-1", IamType.USER
+        )
+
+        self.assertEqual(1, len(resolved))
+        self.assertEqual(IamType.USER, resolved[0].type)
+
+    def test_aad_backed_team_expands_to_dataverse_members(self):
+        user = DataverseUser(
+            id="user-in-aad-team",
+            name="AAD Team Member",
+            email="aad-member@example.com",
+            azure_ad_object_id="entra-member-1",
+        )
         team = DataverseTeam(
             id="team-aad-1",
             name="AAD Team",
             team_type=2,
             azure_ad_object_id="entra-group-1",
+            member_ids=["user-in-aad-team"],
         )
-        self.client.environment = _FakeEnvironment(teams=[team])
+        self.client.environment = _FakeEnvironment(users=[user], teams=[team])
 
         resolved = self.client.__resolve_permission_object__(
             "team-aad-1", IamType.GROUP
         )
 
         self.assertEqual(len(resolved), 1)
-        self.assertEqual("entra-group-1", resolved[0].id)
-        self.assertEqual(IamType.GROUP, resolved[0].type)
-        self.assertEqual("entra-group-1", resolved[0].entra_object_id)
+        self.assertEqual("entra-member-1", resolved[0].id)
+        self.assertEqual(IamType.USER, resolved[0].type)
+        self.assertEqual("entra-member-1", resolved[0].entra_object_id)
 
     def test_owner_team_single_member_expands_to_user(self):
         user = DataverseUser(

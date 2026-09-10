@@ -20,9 +20,11 @@ from policyweaver.plugins.dataverse.model import (
     DataverseTablePermission,
     DataverseEnvironment,
     DataverseBusinessUnit,
+    DataverseColumnMetadata,
     DataverseSecurityRole,
     DataverseFieldSecurityProfile,
     DataverseFieldPermission,
+    DataverseTableMetadata,
 )
 from policyweaver.models.config import (
     Source,
@@ -230,11 +232,11 @@ class TestDivergentFspSplitsRoles(unittest.TestCase):
         self.assertEqual(cols, {"name", "phone"})
         self.assertNotIn("email", cols)
 
-    def test_role_names_include_principal_identity(self) -> None:
+    def test_role_names_use_stable_cls_group_suffixes(self) -> None:
         export = _build_export(self.env)
         names = {p.name for p in export.policies}
-        self.assertTrue(any("alice@example.com" in n for n in names))
-        self.assertTrue(any("bob@example.com" in n for n in names))
+        self.assertEqual(2, len(names))
+        self.assertTrue(all("_CLS" in name for name in names))
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +346,7 @@ class TestClsSplitPreservesRowConstraints(unittest.TestCase):
         export = _build_export(self.env)
         for policy in export.policies:
             filt = policy.rowconstraints[0].filter_condition
-            self.assertIn("_owningbusinessunit_value", filt)
+            self.assertIn("owningbusinessunit", filt)
             self.assertIn("bu-root", filt)
 
 
@@ -550,6 +552,26 @@ class TestDivergenceDetectionDirect(unittest.TestCase):
         )
         client = _build_client(env)
         principals = {("user-A", IamType.USER), ("user-B", IamType.USER)}
+        self.assertFalse(client.__principals_have_divergent_cls__(principals))
+
+    def test_different_profiles_with_same_grants_returns_false(self) -> None:
+        env = DataverseEnvironment(
+            users=_USERS,
+            teams=[],
+            business_units=_BUS,
+            security_roles=_ROLES,
+            role_privileges=[],
+            user_role_assignments={},
+            team_role_assignments={},
+            field_security_profiles=[
+                _fsp("fsp-1", "P1", ["user-A"], [], "account", ["name"]),
+                _fsp("fsp-2", "P2", ["user-B"], [], "account", ["name"]),
+            ],
+            table_permissions=[],
+        )
+        client = _build_client(env)
+        principals = {("user-A", IamType.USER), ("user-B", IamType.USER)}
+
         self.assertFalse(client.__principals_have_divergent_cls__(principals))
 
     def test_single_principal_returns_false(self) -> None:
@@ -910,22 +932,24 @@ class TestAadGroupPlusUserDivergent(unittest.TestCase):
             ],
         )
 
-    def test_three_per_user_roles(self) -> None:
+    def test_two_effective_entitlement_roles(self) -> None:
         export = _build_export(self.env)
-        self.assertEqual(len(export.policies), 3)
+        self.assertEqual(len(export.policies), 2)
 
-    def test_all_roles_are_individual_users(self) -> None:
+    def test_identical_entitlements_share_a_role(self) -> None:
         export = _build_export(self.env)
+        self.assertEqual(
+            [1, 2], sorted(len(p.permissionobjects) for p in export.policies)
+        )
         for p in export.policies:
-            self.assertEqual(len(p.permissionobjects), 1)
-            self.assertEqual(p.permissionobjects[0].type, IamType.USER)
+            self.assertTrue(all(po.type == IamType.USER for po in p.permissionobjects))
 
     def test_alice_gets_fsp1_columns(self) -> None:
         export = _build_export(self.env)
         alice = [
             p
             for p in export.policies
-            if p.permissionobjects[0].entra_object_id == "entra-A"
+            if any(po.entra_object_id == "entra-A" for po in p.permissionobjects)
         ]
         self.assertEqual(len(alice), 1)
         cols = set()
@@ -938,7 +962,7 @@ class TestAadGroupPlusUserDivergent(unittest.TestCase):
         bob = [
             p
             for p in export.policies
-            if p.permissionobjects[0].entra_object_id == "entra-B"
+            if any(po.entra_object_id == "entra-B" for po in p.permissionobjects)
         ]
         self.assertEqual(len(bob), 1)
         cols = set()
@@ -951,7 +975,7 @@ class TestAadGroupPlusUserDivergent(unittest.TestCase):
         carol = [
             p
             for p in export.policies
-            if p.permissionobjects[0].entra_object_id == "entra-C"
+            if any(po.entra_object_id == "entra-C" for po in p.permissionobjects)
         ]
         self.assertEqual(len(carol), 1)
         cols = set()
@@ -1022,6 +1046,7 @@ class TestSharedPathAadTeamOnlyCls(unittest.TestCase):
                     table_name="account",
                     principal_id="team-aad",
                     principal_type=IamType.GROUP,
+                    has_read=True,
                     role_id="role1",
                     role_name="SalesRole",
                     role_business_unit_id="bu1",
@@ -1104,6 +1129,7 @@ class TestSharedPathAadTeamFspViaTeamId(unittest.TestCase):
                     table_name="contact",
                     principal_id="team-aad",
                     principal_type=IamType.GROUP,
+                    has_read=True,
                     role_id="role1",
                     role_name="ServiceRole",
                     role_business_unit_id="bu1",
@@ -1183,6 +1209,7 @@ class TestSharedPathMixedUserAndAadTeamCls(unittest.TestCase):
                     table_name="lead",
                     principal_id="u1",
                     principal_type=IamType.USER,
+                    has_read=True,
                     role_id="role1",
                     role_name="LeadRole",
                     role_business_unit_id="bu1",
@@ -1193,6 +1220,7 @@ class TestSharedPathMixedUserAndAadTeamCls(unittest.TestCase):
                     table_name="lead",
                     principal_id="team-aad",
                     principal_type=IamType.GROUP,
+                    has_read=True,
                     role_id="role1",
                     role_name="LeadRole",
                     role_business_unit_id="bu1",
@@ -1218,6 +1246,149 @@ class TestSharedPathMixedUserAndAadTeamCls(unittest.TestCase):
     def test_shared_role_has_two_members(self) -> None:
         export = _build_export(self.env)
         self.assertEqual(len(export.policies[0].permissionobjects), 2)
+
+
+class TestMissingFieldSecurityGrantFailsClosed(unittest.TestCase):
+    def test_secured_table_without_readable_columns_fails_role_with_sibling(
+        self,
+    ) -> None:
+        contact_permission = DataverseTablePermission(
+            table_name="contact",
+            principal_id="user-A",
+            principal_type=IamType.USER,
+            principal_business_unit_id="bu-root",
+            has_read=True,
+            depth="Global",
+            role_id="role-1",
+            role_name="Analyst",
+            role_business_unit_id="bu-root",
+        )
+        environment = DataverseEnvironment(
+            users=[_USERS[0], _USERS[1]],
+            teams=[],
+            business_units=_BUS,
+            security_roles=_ROLES,
+            field_security_profiles=[
+                _fsp(
+                    "fsp-bob",
+                    "Bob only",
+                    ["user-B"],
+                    [],
+                    "account",
+                    ["secretcolumn"],
+                )
+            ],
+            table_permissions=[_TABLE_PERMS_GLOBAL[0], contact_permission],
+        )
+
+        with self.assertRaisesRegex(ValueError, "no readable columns"):
+            _build_export(environment)
+
+    def test_metadata_for_one_table_does_not_suppress_other_table_fallback(
+        self,
+    ) -> None:
+        environment = DataverseEnvironment(
+            users=[_USERS[0]],
+            field_security_profiles=[
+                DataverseFieldSecurityProfile(
+                    id="fsp-alice",
+                    user_ids=["user-A"],
+                    permissions=[
+                        DataverseFieldPermission(
+                            entity_name="account",
+                            attribute_logical_name="accountsecret",
+                            can_read=4,
+                        ),
+                        DataverseFieldPermission(
+                            entity_name="contact",
+                            attribute_logical_name="contactsecret",
+                            can_read=4,
+                        ),
+                    ],
+                )
+            ],
+            table_metadata=[
+                DataverseTableMetadata(
+                    logical_name="account",
+                    has_secured_columns=True,
+                    columns=[
+                        DataverseColumnMetadata(logical_name="name", is_secured=False),
+                        DataverseColumnMetadata(
+                            logical_name="accountsecret", is_secured=True
+                        ),
+                    ],
+                )
+            ],
+        )
+        client = _build_client(environment)
+
+        constraints = client.__get_column_constraints_for_principals__(
+            {("user-A", IamType.USER)},
+            {"account", "contact"},
+            "TestCatalog",
+            "dbo",
+        )
+
+        columns_by_table = {
+            constraint.table_name: set(constraint.column_names)
+            for constraint in constraints
+        }
+        self.assertEqual({"name", "accountsecret"}, columns_by_table["account"])
+        self.assertEqual({"contactsecret"}, columns_by_table["contact"])
+
+
+class TestUnsupportedMultiRoleRlsClsComposition(unittest.TestCase):
+    def test_same_user_multiple_roles_with_rls_and_cls_fails_preflight(self) -> None:
+        environment = DataverseEnvironment(
+            users=[_USERS[0]],
+            teams=[],
+            business_units=_BUS,
+            security_roles=[
+                DataverseSecurityRole(
+                    id="role-local", name="Local Reader", business_unit_id="bu-root"
+                ),
+                DataverseSecurityRole(
+                    id="role-global",
+                    name="Global Reader",
+                    business_unit_id="bu-root",
+                ),
+            ],
+            field_security_profiles=[
+                _fsp(
+                    "fsp-alice",
+                    "Alice",
+                    ["user-A"],
+                    [],
+                    "account",
+                    ["secretcolumn"],
+                )
+            ],
+            table_permissions=[
+                DataverseTablePermission(
+                    table_name="account",
+                    principal_id="user-A",
+                    principal_type=IamType.USER,
+                    has_read=True,
+                    depth="Local",
+                    role_id="role-local",
+                    role_name="Local Reader",
+                    role_business_unit_id="bu-root",
+                ),
+                DataverseTablePermission(
+                    table_name="account",
+                    principal_id="user-A",
+                    principal_type=IamType.USER,
+                    has_read=True,
+                    depth="Global",
+                    role_id="role-global",
+                    role_name="Global Reader",
+                    role_business_unit_id="bu-root",
+                ),
+            ],
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot evaluate.*RLS/CLS"):
+            _build_export(environment)
 
 
 if __name__ == "__main__":

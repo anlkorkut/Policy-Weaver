@@ -4,6 +4,7 @@ from pydantic import BaseModel, ConfigDict
 import hashlib
 import json
 
+
 class CommonBaseModel(BaseModel):
     """
     Base model for all common models in the Policy Weaver application.
@@ -11,6 +12,7 @@ class CommonBaseModel(BaseModel):
     Attributes:
         model_config (ConfigDict): Configuration for the model.
     """
+
     model_config = ConfigDict(
         populate_by_name=True,
         use_enum_values=True,
@@ -27,9 +29,11 @@ class CommonBaseModel(BaseModel):
         Returns:
             str: The SHA-256 hash of the model's JSON representation.
         """
-        data = json.dumps(self.model_dump_json(exclude_none=True, exclude_unset=True), sort_keys=True)
-        return hashlib.sha256(data.encode('utf-8')).hexdigest()
-    
+        data = json.dumps(
+            self.model_dump_json(exclude_none=True, exclude_unset=True), sort_keys=True
+        )
+        return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
     def model_dump(self, **kwargs) -> dict[str, Any]:
         """
         Dumps the model to a dictionary, using aliases for field names.
@@ -59,7 +63,7 @@ class CommonBaseModel(BaseModel):
         Returns:
             Any: The value of the attribute if it exists, otherwise raises AttributeError.
         """
-        for field, meta in self.model_fields.items():
+        for field, meta in type(self).model_fields.items():
             if meta.alias == item:
                 return getattr(self, field)
         return super().__getattr__(item)
@@ -72,7 +76,7 @@ class CommonBaseModel(BaseModel):
         Returns:
             str: The alias for the item if it exists, otherwise None.
         """
-        for field, meta in self.model_fields.items():
+        for field, meta in type(self).model_fields.items():
             if field == item_name:
                 return meta.alias
 

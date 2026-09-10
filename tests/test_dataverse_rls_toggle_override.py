@@ -125,9 +125,7 @@ class TestRlsToggleOverride(unittest.TestCase):
 
         self.assertIsNotNone(policy.rowconstraints)
         self.assertEqual(len(policy.rowconstraints), 1)
-        self.assertIn(
-            "_owningbusinessunit_value", policy.rowconstraints[0].filter_condition
-        )
+        self.assertIn("owningbusinessunit", policy.rowconstraints[0].filter_condition)
 
     def test_rls_off_deep_depth_emits_row_constraint(self):
         export = self._build_export(rls_enabled=False, depth="Deep")
@@ -135,9 +133,7 @@ class TestRlsToggleOverride(unittest.TestCase):
 
         self.assertIsNotNone(policy.rowconstraints)
         self.assertEqual(len(policy.rowconstraints), 1)
-        self.assertIn(
-            "_owningbusinessunit_value", policy.rowconstraints[0].filter_condition
-        )
+        self.assertIn("owningbusinessunit", policy.rowconstraints[0].filter_condition)
 
     def test_rls_off_basic_depth_emits_row_constraint(self):
         export = self._build_export(rls_enabled=False, depth="Basic")
@@ -145,7 +141,7 @@ class TestRlsToggleOverride(unittest.TestCase):
 
         self.assertIsNotNone(policy.rowconstraints)
         self.assertEqual(len(policy.rowconstraints), 1)
-        self.assertIn("_ownerid_value", policy.rowconstraints[0].filter_condition)
+        self.assertIn("ownerid", policy.rowconstraints[0].filter_condition)
 
     def test_rls_off_unknown_depth_emits_deny_all_row_constraint(self):
         export = self._build_export(rls_enabled=False, depth="Unknown")
@@ -199,9 +195,7 @@ class TestRlsToggleOverride(unittest.TestCase):
 
         self.assertIsNotNone(policy.rowconstraints)
         self.assertEqual(len(policy.rowconstraints), 1)
-        self.assertIn(
-            "_owningbusinessunit_value", policy.rowconstraints[0].filter_condition
-        )
+        self.assertIn("owningbusinessunit", policy.rowconstraints[0].filter_condition)
 
 
 if __name__ == "__main__":

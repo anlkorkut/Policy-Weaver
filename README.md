@@ -256,10 +256,93 @@ Policy Weaver fetches the following security metadata from your Dataverse enviro
 - **Privilege Depth**: The scope of each read privilege (Basic/User, Local/Business Unit, Deep/Parent BU, Global/Organization)
 - **Field Security Profiles**: Column-level security profiles with read permissions and user/team assignments
 
+### Privilege Depth Mapping
+
+Policy Weaver maps Dataverse privilege depth levels to Fabric row-level security filters:
+
+| Dataverse Depth | Dataverse Name | Fabric Row Filter | Description |
+|---|---|---|---|
+| User | Basic | `ownerid in ('<principal IDs>')` | Rows owned by the user or their teams |
+| Business Unit | Local | `owningbusinessunit = '<role BU>'` | Rows in the role's business unit only |
+| Parent: Child Business Units | Deep | `owningbusinessunit in ('<role BU>', '<descendant BUs>')` | Rows in the role's BU and all child BUs |
+| Organization | Global | No row filter | All rows visible |
+| Unknown / Unrecognized | — | `false` (deny all) | Fail-closed for safety |
+
+> :pushpin: **Note:** Dataverse access is cumulative — the greatest depth prevails. If a user has both a Local and a Global role on the same table, Global wins and no row filter is applied.
+
+### Fabric OneLake Security Role Limits
+
+OneLake Security has a default limit of **250 Data Access Roles** per item. In environments with many Dataverse security roles, users, and business units, Policy Weaver may generate roles that approach or exceed this limit — especially when per-principal splitting is used for Basic-depth or CLS isolation.
+
+If you encounter the role count limit, you can request Microsoft to increase it to **1,000 roles** via a support ticket. Plan your Dataverse security role structure accordingly:
+- Roles with **Global** depth generally share a Fabric role across members when CLS and OneLake chunking permit it
+- Roles with **Local** or **Deep** depth can split per principal when cumulative personal or team ownership outside the BU scope requires an ownership overlay
+- Roles with **Basic** depth split per effective principal for owner isolation
+- Divergent field-security access is grouped by effective column allowlist, then split only when a group exceeds 500 members
+
+Each OneLake role can contain at most **500 users or groups** and **500 permissions**. Policy Weaver automatically chunks larger shared Dataverse roles and includes those chunks in its preflight role-count check. For example, 12,500 directly assigned users require at least 25 OneLake roles when they share identical access with no per-principal ownership or CLS split. Although an AAD-backed Dataverse team can reduce member count in permissive legacy mode, strict and partial modes block dynamic group-team role, field-security, and ownership-overlay dependencies because the snapshot cannot prove their effective membership.
+
+Set `dataverse.onelake_role_limit` to the quota approved for the target Fabric item. Policy generation fails before upload when exact Basic/CLS isolation, member chunks, permission chunks, or row-filter chunks exceed that quota.
+
+The current Fabric REST schema does not document a maximum length for `RowConstraint.value`. Policy Weaver nevertheless chunks long Dataverse predicates as an internal safeguard. On July 30, 2026, `dryRun=true` against the test mirror accepted predicates through **4,096 characters** and rejected 4,097 with `PolicyValidationError: Predicate in Row Constraint should not exceed 4096`. This is observed runtime behavior for that target, not a maximum declared by the REST schema. The default internal boundary is **4,096 characters** and can be changed with `dataverse.row_constraint_chunk_length`; validate candidate boundaries with `dryRun=true` for each target before changing it.
+
+Generated Fabric role names are normalized to alphanumeric characters, include a stable hash, preserve the configured suffix, and are capped at 128 characters. The 4,096-character limit applies to row-constraint SQL, not role names.
+
 ### Policy Mapping Modes
 
-- **`role_based`** (recommended): Creates one Fabric role per Dataverse security role. Supports column-level security.
-- **`table_based`**: Creates one Fabric role per table with all principals who have read access. Does **not** support column-level security.
+- **`role_based`** (required): Starts from Dataverse security roles, then safely groups or chunks policies where OneLake limits and effective RLS/CLS entitlements require it.
+
+Dataverse publication has two explicit validation modes:
+
+- **Strict parity** (default): Any unsupported or incomplete security mechanism stops the whole run before Fabric.
+- **Partial sync** (`--partial-sync`): Quarantines an entire Dataverse role when any of its grants has RecordFilter/unknown depth, an unrepresentable row predicate, no readable CLS columns, missing ownership metadata, scoped access on an unsupported ownership type, invalid BU/assignment context, dynamic Entra group-team semantics, unsupported multi-role RLS+CLS, or no remaining OneLake role capacity. This includes `dynamic_group_team_ownership` when a generated per-user owner filter depends on an AAD-backed team whose effective membership cannot be proven. Identity-only failures are narrower: unresolved application users, ineligible users, missing direct-user snapshots, and missing Owner/Access team snapshot members are omitted from direct assignments or team expansion after Graph validation. Resolvable peers keep the role's complete permissions; a role left with no resolvable members is quarantined with `no_resolvable_members`. Global reads on BusinessOwned tables need no row predicate, while Local and Deep reads use the mirrored table's `businessunitid`; Basic BusinessOwned reads remain unsupported and fail closed. Exact access parity is explicitly false.
+
+Partial sync also reports environment-wide limitations such as unverified POA, POAA, hierarchy security, or column masking. These mechanisms are additive in Dataverse, so omitting them under-grants access; partial mode never treats their absence as parity evidence. Roles touching a table affected by a dynamic Entra group-assigned field security profile are quarantined rather than using an unverified membership snapshot. The connector reads active Dataverse `AttributeMaskingRule` assignments for the selected table scope: an empty authoritative result proves masking is absent, while roles touching an active masking assignment are quarantined because OneLake column allowlists cannot reproduce masked-value presentation or `CanReadUnmasked` privileges. `dataverse.column_masking_status: verified_absent` remains a fallback only for externally supplied snapshots that do not contain masking-assignment state.
+
+Before publication, both strict and partial modes resolve application users that have only an `applicationid` (no Azure AD object id) through Microsoft Graph, and only for identities assigned within the configured table scope. **Strict parity** fails the entire run when any in-scope app-only identity cannot be resolved: no policies are applied and the export never receives the strict validation stamp, so a downstream apply is rejected. **Partial sync** is narrower: an unresolved application identity omits only that user's direct role assignments and Owner/Access team expansions, while otherwise valid members of the same source role remain publishable. The partial report records these omissions in `skipped_principal_assignment_count`, `principal_reason_counts`, and `skipped_principal_assignments` without including emails or display names. Grant the Policy Weaver application `Application.Read.All` application permission with admin consent to avoid failing (strict) or omitting (partial) valid application users. A Graph permission failure is treated as unresolved and therefore fails the strict run or under-grants in partial mode rather than exposing data.
+
+A missing direct-user snapshot is omitted and audited at principal level because no business-unit context exists to evaluate. That exemption applies only when the user snapshot is truly absent. A known user excluded for ineligibility or unresolved Graph identity still whole-role quarantines as `invalid_assignment_context` when its business unit is missing or differs from the role business unit.
+
+Partial apply is an authoritative replacement of Policy Weaver-managed Fabric roles. A quarantined role is absent from the desired collection and any older managed version is removed. Compare the current managed-role count with `quarantine.projected_onelake_role_count` before applying. The command refuses to publish when every role is quarantined or when policy conversion produces no publishable roles, requires a successful Fabric dry-run, takes a rollback snapshot, and requires both the exact item ID and `--confirm-partial-sync`.
+
+Before any Fabric dry-run or apply, the CLI replays the current sanitized role collection with `dryRun=true` and its collection ETag. This write-readiness check happens before Dataverse extraction, so a suspended Fabric capacity fails quickly without changing roles. A `FabricCapacityNotActiveError` identifies the capacity and records `fabric_write_preflight: blocked-capacity-not-active` in the report. Resume the F SKU capacity through its Azure resource, or have its Azure owner reassign the workspace to an active compatible capacity. Resuming a capacity restarts billing.
+
+```powershell
+# 1. Compile and review reports/dataverse-policy-partial-compile.json.
+& .\.venv-x64\Scripts\python.exe -m scripts.dataverse_policy_sync `
+  --config configdataverse.yaml `
+  --tables-file reports\fabric-lakehouse-table-names.txt `
+  --partial-sync `
+  --output reports\dataverse-policy-partial-compile.json
+
+# 2. Validate the complete replacement payload without changing Fabric.
+& .\.venv-x64\Scripts\python.exe -m scripts.dataverse_policy_sync `
+  --config configdataverse.yaml `
+  --tables-file reports\fabric-lakehouse-table-names.txt `
+  --partial-sync `
+  --fabric-dry-run `
+  --confirm-item <exact-fabric-item-id> `
+  --output reports\dataverse-policy-partial-dryrun.json
+
+# 3. Apply only after reviewing the quarantine and dry-run reports.
+& .\.venv-x64\Scripts\python.exe -m scripts.dataverse_policy_sync `
+  --config configdataverse.yaml `
+  --tables-file reports\fabric-lakehouse-table-names.txt `
+  --partial-sync `
+  --apply `
+  --confirm-partial-sync `
+  --confirm-item <exact-fabric-item-id> `
+  --rollback-output reports\dataverse-policy-partial-rollback.json `
+  --output reports\dataverse-policy-partial-apply.json
+```
+
+When CLS is enabled, a secured role/table with no readable columns is not serialized as an empty allowlist. Strict Dataverse compilation fails the whole run; partial sync quarantines the entire source role, including otherwise valid sibling-table grants, with `no_readable_columns`.
+
+Likewise, if even one value cannot fit the configured row-constraint predicate budget, strict compilation fails and partial sync quarantines the entire source role with `unrepresentable_row_constraint`. A serializer limitation never becomes a table-only deny or a weakened sibling grant.
+
+Ownership-derived predicates that require multiple row chunks cannot be safely combined with CLS on the same table. Partial sync quarantines the whole source role with `unsupported_multi_role_rls_cls`; strict mode fails compilation. The only partial-mode exception is a scoped user-table grant made redundant by a surviving Global grant for the same user and table. Policy Weaver removes that redundant edge, preserves the role's other members and tables in residual policies, recomputes capacity, and records the result in `constraint_composition_conflicts` and `suppressed_redundant_scoped_grants`. Strict and partial modes also block AAD-backed dynamic team ownership dependencies before publication because their effective membership cannot be proven from the snapshot.
+
+OneLake doesn't support a user reaching the same CLS-secured table through multiple roles when any of those roles contains RLS. This is common in Dataverse environments where access is cumulative across several security roles. Strict mode stops before upload. Partial mode resolves only the provably redundant Global-dominance case above; all scoped-vs-scoped and partially dominated chunked combinations remain whole-role quarantines.
 
 ### Update your Configuration file
 
@@ -291,7 +374,7 @@ constraints:
     columnlevelsecurity: true
     fallback: deny
   rows:
-    rowlevelsecurity: false
+    rowlevelsecurity: true
     fallback: deny
 service_principal:
   client_id: your-client-id
@@ -302,6 +385,20 @@ source:
 type: DATAVERSE
 dataverse:
   environment_url: https://yourorg.crm.dynamics.com
+  # Set this to the Data Access Role quota approved for the Fabric item.
+  onelake_role_limit: 1000
+  # Policy Weaver safeguard; this is not a documented Fabric service maximum.
+  row_constraint_chunk_length: 4096
+  # Required before any Fabric operation. Unsupported or incomplete source
+  # security mechanisms stop compilation rather than silently under-granting.
+  strict_access_parity: true
+  # Leave false in YAML; enable explicitly with --partial-sync for each command.
+  partial_sync: false
+  # Leave unverified until an external POA review proves relevant shares are empty.
+  poa_read_access_status: unverified
+  # Fallback for externally supplied snapshots without masking-assignment state.
+  # Live Dataverse extraction checks AttributeMaskingRule records directly.
+  column_masking_status: unverified
 ```
 
 ### Run the Weaver!
@@ -316,7 +413,8 @@ from policyweaver.plugins.dataverse.model import DataverseSourceMap
 #Load config
 config = DataverseSourceMap.from_yaml("path_to_your_config.yaml")
 
-#run the PolicyWeaver
+# Run non-Dataverse connectors. Dataverse publication must use the guarded
+# scripts/dataverse_policy_sync.py workflow shown above.
 await WeaverAgent.run(config)
 ```
 
@@ -339,7 +437,7 @@ Here ´s how the config.yaml should be adjusted to your environment.
     - tenant_id: your fabric tenant id (you can find it in the URL "help" -> "about Fabric" section of the Fabric UI)
     - fabric_role_suffix: suffix for the fabric roles created by Policy Weaver (default: PW)
     - delete_default_reader_role: true/false (if true, the DefaultReader role created by Fabric will be deleted, if false it will be kept, default: true)
-    - policy_mapping: role_based: create one role per role/group, default: role_based)
+    - policy_mapping: role_based: create one role per role/group, default: role_based
 - constraints:
     - columns: (optional, if not set, no column level security will be applied, see below for details [Column Level Security](#books-column-level-security))
       - columnlevelsecurity: true/false (if true, column level security will be applied at best effort. Default: false)
@@ -472,7 +570,7 @@ Supported column mask policies:
 - Dataverse:
   - Field-level read permissions from Dataverse field security profiles are mapped to Fabric column constraints for role-based policies.
 
-If for a specific role all columns of a table are denied, the whole table is denied to this role and will not show up in the Fabric for this role.
+For Dataverse, if a role/table has no readable columns, strict compilation fails the whole run and partial sync quarantines the entire source role. Policy Weaver never keeps that role's sibling-table grants while dropping only the affected table.
 :warning: NOTE: Our recommendation is to set the fallback to deny to avoid unintentional data exposure. If you identify a scenaro where there is a data exposure risk, please give us feedback and we´ll try to fix it asap. Note though that this solution is provided as-is without any warranties.
 
 ## :books: Row Level Security
@@ -510,7 +608,7 @@ Supported row access policies:
 If you see demand for more (simple) row access policies which are not supported, please give us feedback and we´ll try to add them.
 
 
-If for a specific role all columns of a table are denied, the whole table is denied to this role and will not show up in the Fabric for this role.
+Dataverse serializer or predicate-budget failures are handled before role publication: strict mode fails compilation, while partial mode quarantines the entire source role rather than omitting one table and publishing its siblings.
 
 
 ## :raising_hand: Feedback

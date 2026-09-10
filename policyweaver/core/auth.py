@@ -1,7 +1,10 @@
 from azure.identity import ClientSecretCredential, AzureCliCredential
 import os
+import threading
+import time
 
 from policyweaver.core.common import classproperty
+
 
 class ServicePrincipal:
     """
@@ -14,8 +17,13 @@ class ServicePrincipal:
         token = ServicePrincipal.get_token()
         headers = ServicePrincipal.get_token_header()
     """
+
+    _credential = None
+    _tokens = {}
+    _lock = threading.RLock()
+
     @classmethod
-    def initialize(cls, tenant_id:str, client_id:str, client_secret: str):
+    def initialize(cls, tenant_id: str, client_id: str, client_secret: str):
         """
         Initialize the service principal with the provided tenant ID, client ID, and client secret.
         This method sets the environment variables required for authentication and clears any existing token.
@@ -24,7 +32,11 @@ class ServicePrincipal:
             client_id (str): The client ID of the service principal.
             client_secret (str): The client secret of the service principal.
         """
-        cls.__token__ = None
+        with cls._lock:
+            if cls._credential:
+                cls._credential.close()
+            cls._credential = None
+            cls._tokens = {}
 
         os.environ["SP_TENANT_ID"] = tenant_id
         os.environ["SP_CLIENT_ID"] = client_id
@@ -39,11 +51,14 @@ class ServicePrincipal:
         Returns:
             ClientSecretCredential: An instance of ClientSecretCredential initialized with the service principal's credentials.
         """
-        return ClientSecretCredential(
-            cls.TenantId,
-            cls.ClientId,
-            cls.ClientSecret
-        )
+        with cls._lock:
+            if cls._credential is None:
+                cls._credential = ClientSecretCredential(
+                    cls.TenantId,
+                    cls.ClientId,
+                    cls.ClientSecret,
+                )
+            return cls._credential
 
     @classproperty
     def TenantId(cls) -> str:
@@ -54,7 +69,7 @@ class ServicePrincipal:
             str: The tenant ID of the service principal.
         """
         return os.environ["SP_TENANT_ID"]
-    
+
     @classproperty
     def ClientId(cls) -> str:
         """
@@ -64,7 +79,7 @@ class ServicePrincipal:
             str: The client ID of the service principal.
         """
         return os.environ["SP_CLIENT_ID"]
-    
+
     @classproperty
     def ClientSecret(cls) -> str:
         """
@@ -74,9 +89,13 @@ class ServicePrincipal:
             str: The client secret of the service principal.
         """
         return os.environ["SP_CLIENT_SECRET"]
-    
+
     @classmethod
-    def get_token(cls, scope="https://api.fabric.microsoft.com/.default") -> str:
+    def get_token(
+        cls,
+        scope="https://api.fabric.microsoft.com/.default",
+        force_refresh: bool = False,
+    ) -> str:
         """
         Retrieves an access token for the Azure Fabric API using the service principal's credentials.
         If the token is not already cached, it creates a new token using the ClientSecretCredential.
@@ -84,12 +103,23 @@ class ServicePrincipal:
         Returns:
             str: The access token for the Azure Fabric API.
         """
-        cls.__token__ = cls.Credential.get_token(scope)
-        
-        return cls.__token__.token
+        with cls._lock:
+            token = cls._tokens.get(scope)
+            if (
+                force_refresh
+                or token is None
+                or int(time.time()) >= token.expires_on - 120
+            ):
+                token = cls.Credential.get_token(scope)
+                cls._tokens[scope] = token
+            return token.token
 
     @classmethod
-    def get_token_header(cls, scope="https://api.fabric.microsoft.com/.default") -> dict:
+    def get_token_header(
+        cls,
+        scope="https://api.fabric.microsoft.com/.default",
+        force_refresh: bool = False,
+    ) -> dict:
         """
         Returns a dictionary containing the authorization header with the Bearer token.
         This header can be used in API requests to authenticate with the Azure Fabric API.
@@ -97,8 +127,9 @@ class ServicePrincipal:
             dict: A dictionary with the authorization header containing the Bearer token.
         """
         return {
-            "Authorization": f"Bearer {cls.get_token(scope)}",
+            "Authorization": f"Bearer {cls.get_token(scope, force_refresh)}",
         }
+
 
 class AzureCLIClient:
     """
@@ -106,6 +137,7 @@ class AzureCLIClient:
     This class provides methods to retrieve the access token using the Azure CLI.
     It is used when the service principal is not available or when using Azure CLI authentication.
     """
+
     @classmethod
     def initialize(cls):
         """
@@ -122,7 +154,7 @@ class AzureCLIClient:
             AzureCliCredential: An instance of AzureCliCredential.
         """
         return AzureCliCredential()
-    
+
     @classmethod
     def get_token(cls, scope="https://api.fabric.microsoft.com/.default") -> str:
         """
@@ -133,9 +165,11 @@ class AzureCLIClient:
         """
         cls.__token__ = cls.Credential.get_token(scope)
         return cls.__token__.token
-    
+
     @classmethod
-    def get_token_header(cls, scope="https://api.fabric.microsoft.com/.default") -> dict:
+    def get_token_header(
+        cls, scope="https://api.fabric.microsoft.com/.default"
+    ) -> dict:
         """
         Returns a dictionary containing the authorization header with the Bearer token.
         This header can be used in API requests to authenticate with the Azure Fabric API.

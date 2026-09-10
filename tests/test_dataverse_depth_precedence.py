@@ -200,5 +200,103 @@ class TestDepthMaskMapping(unittest.TestCase):
         self.assertNotIn(3, DEPTH_MASK_MAP)
 
 
+class TestBulkRolePrivilegeExtraction(unittest.TestCase):
+    def test_joins_global_collections_without_per_role_requests(self):
+        client = DataverseAPIClient.__new__(DataverseAPIClient)
+        client.api_url = "https://example.crm.dynamics.com/api/data/v9.2"
+        client.logger = _FakeLogger()
+        requested_urls = []
+
+        def fake_get_paged(url):
+            requested_urls.append(url)
+            if "/roleprivilegescollection" in url:
+                return [
+                    {
+                        "roleid": "role-1",
+                        "privilegeid": "priv-read-account",
+                        "privilegedepthmask": 4,
+                    },
+                    {
+                        "roleid": "role-1",
+                        "privilegeid": "priv-write-account",
+                        "privilegedepthmask": 8,
+                    },
+                    {
+                        "roleid": "unselected-role",
+                        "privilegeid": "priv-read-contact",
+                        "privilegedepthmask": 8,
+                    },
+                ]
+            if "/privileges" in url:
+                return [
+                    {
+                        "privilegeid": "priv-read-account",
+                        "name": "prvReadaccount",
+                        "accessright": 1,
+                    },
+                    {
+                        "privilegeid": "priv-write-account",
+                        "name": "prvWriteaccount",
+                        "accessright": 2,
+                    },
+                    {
+                        "privilegeid": "priv-read-contact",
+                        "name": "prvReadcontact",
+                        "accessright": 1,
+                    },
+                ]
+            self.fail(f"Unexpected URL: {url}")
+
+        client._get_paged = fake_get_paged
+        roles = [DataverseSecurityRole(id="role-1", name="Reader")]
+
+        result = client.__get_role_read_privileges__(roles)
+
+        self.assertEqual(2, len(requested_urls))
+        self.assertFalse(any("/roles(" in url for url in requested_urls))
+        self.assertEqual(1, len(result))
+        self.assertEqual("account", result[0].entity_name)
+        self.assertEqual("Deep", result[0].depth)
+
+    def test_child_role_inherits_root_role_privileges(self):
+        client = DataverseAPIClient.__new__(DataverseAPIClient)
+        client.api_url = "https://example.crm.dynamics.com/api/data/v9.2"
+        client.logger = _FakeLogger()
+
+        def fake_get_paged(url):
+            if "/roleprivilegescollection" in url:
+                return [
+                    {
+                        "roleid": "root-role",
+                        "privilegeid": "priv-read-account",
+                        "privilegedepthmask": 4,
+                    }
+                ]
+            if "/privileges" in url:
+                return [
+                    {
+                        "privilegeid": "priv-read-account",
+                        "name": "prvReadaccount",
+                        "accessright": 1,
+                    }
+                ]
+            self.fail(f"Unexpected URL: {url}")
+
+        client._get_paged = fake_get_paged
+        roles = [
+            DataverseSecurityRole(id="root-role", name="Reader"),
+            DataverseSecurityRole(
+                id="child-role",
+                name="Reader",
+                parent_root_role_id="root-role",
+            ),
+        ]
+
+        result = client.__get_role_read_privileges__(roles)
+
+        self.assertEqual({"root-role", "child-role"}, {p.role_id for p in result})
+        self.assertTrue(all(p.depth == "Deep" for p in result))
+
+
 if __name__ == "__main__":
     unittest.main()

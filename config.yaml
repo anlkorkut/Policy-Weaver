@@ -36,3 +36,5 @@ snowflake:
   warehouse: <warehouse name>
 dataverse:
   environment_url: <your Dataverse environment URL e.g. https://org.crm.dynamics.com>
+  onelake_role_limit: 250
+  row_constraint_chunk_length: 4096

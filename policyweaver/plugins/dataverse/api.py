@@ -1,16 +1,15 @@
 import logging
-import json
 import os
+import re
 import time
-from typing import List, Dict
+from typing import Dict, List, Tuple
+from urllib.parse import urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from pydantic.json import pydantic_encoder
 
 from policyweaver.core.auth import ServicePrincipal
-from policyweaver.core.enum import IamType
 from policyweaver.models.config import Source
 from policyweaver.plugins.dataverse.model import (
     DataverseBusinessUnit,
@@ -20,7 +19,10 @@ from policyweaver.plugins.dataverse.model import (
     DataverseRolePrivilege,
     DataverseFieldSecurityProfile,
     DataverseFieldPermission,
-    DataverseTablePermission,
+    DataverseColumnMetadata,
+    DataverseAttributeMaskingRule,
+    DataversePrincipalObjectAttributeAccess,
+    DataverseTableMetadata,
     DataverseEnvironment,
 )
 
@@ -33,9 +35,19 @@ class DataverseAPIClient:
     """
 
     DEFAULT_API_VERSION = "v9.2"
+    EMPTY_GUID = "00000000-0000-0000-0000-000000000000"
     READ_PRIVILEGE_PREFIX = "prvRead"
     READ_ACCESS_RIGHT = 1  # ReadAccess bit in Dataverse privilege access rights
     DEPTH_RANK = {"Basic": 1, "Local": 2, "Deep": 3, "Global": 4}
+
+    @classmethod
+    def _normalize_optional_guid(cls, value) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value)
+        if normalized.casefold() == cls.EMPTY_GUID:
+            return None
+        return normalized
 
     def __init__(self):
         self.logger = logging.getLogger("POLICY_WEAVER")
@@ -86,10 +98,9 @@ class DataverseAPIClient:
 
     @property
     def _headers(self) -> dict:
-        if not self.__token:
-            self._get_access_token()
+        token = self._get_access_token()
         return {
-            "Authorization": f"Bearer {self.__token}",
+            "Authorization": f"Bearer {token}",
             "Accept": "application/json",
             "OData-MaxVersion": "4.0",
             "OData-Version": "4.0",
@@ -99,13 +110,59 @@ class DataverseAPIClient:
     def _get_paged(self, url: str) -> List[dict]:
         """Fetch all pages of an OData collection."""
         results = []
+        seen_urls = set()
+        api_origin = urlsplit(self.api_url)
         while url:
+            page_origin = urlsplit(url)
+            if (
+                page_origin.scheme.lower(),
+                page_origin.netloc.lower(),
+            ) != (api_origin.scheme.lower(), api_origin.netloc.lower()):
+                raise ValueError(
+                    "Dataverse pagination link points outside the Dataverse API "
+                    f"origin: {url}"
+                )
+            if url in seen_urls:
+                raise ValueError(f"Dataverse pagination cycle detected at: {url}")
+            seen_urls.add(url)
+
             response = self._request_get(url)
             response.raise_for_status()
             data = response.json()
-            results.extend(data.get("value", []))
-            url = data.get("@odata.nextLink")
+            if not isinstance(data, dict) or "value" not in data:
+                raise ValueError(
+                    f"Dataverse collection response is missing a value collection: {url}"
+                )
+            page_values = data["value"]
+            if not isinstance(page_values, list):
+                raise ValueError(
+                    f"Dataverse collection response has a non-list value: {url}"
+                )
+            results.extend(page_values)
+            next_link = data.get("@odata.nextLink")
+            if next_link is not None and not isinstance(next_link, str):
+                raise ValueError(
+                    f"Dataverse collection response has an invalid nextLink: {url}"
+                )
+            url = next_link
         return results
+
+    def _get_expanded_collection(
+        self, record: dict, relationship_name: str
+    ) -> List[dict]:
+        """Return a complete expanded relationship, including nested pages."""
+        relationships = record.get(relationship_name, [])
+        if relationships is None:
+            relationships = []
+        if not isinstance(relationships, list):
+            raise ValueError(
+                f"Dataverse relationship '{relationship_name}' was not a collection."
+            )
+
+        next_link = record.get(f"{relationship_name}@odata.nextLink")
+        if next_link:
+            relationships = [*relationships, *self._get_paged(next_link)]
+        return relationships
 
     def get_environment_security_map(self, source: Source) -> DataverseEnvironment:
         """
@@ -117,16 +174,33 @@ class DataverseAPIClient:
         """
         env = DataverseEnvironment()
 
+        self.logger.info("Fetching Dataverse hierarchy security settings...")
+        hierarchy_settings = self.__get_hierarchy_security_settings__()
+        env.hierarchy_security_enabled = hierarchy_settings[0]
+        env.hierarchy_security_uses_position = hierarchy_settings[1]
+        env.hierarchy_security_depth = hierarchy_settings[2]
+
         self.logger.info("Fetching Dataverse business units...")
         env.business_units = self.__get_business_units__()
         self.logger.info(f"Found {len(env.business_units)} business units.")
 
-        self.logger.info("Fetching Dataverse users...")
-        env.users = self.__get_users__()
+        self.logger.info("Fetching Dataverse users and security relationships...")
+        (
+            env.users,
+            env.user_role_assignments,
+            team_member_ids,
+            profile_user_ids,
+        ) = self.__get_users_and_relationships__()
         self.logger.info(f"Found {len(env.users)} active users.")
 
-        self.logger.info("Fetching Dataverse teams...")
-        env.teams = self.__get_teams__()
+        self.logger.info("Fetching Dataverse teams and security relationships...")
+        (
+            env.teams,
+            env.team_role_assignments,
+            profile_team_ids,
+        ) = self.__get_teams_and_relationships__()
+        for team in env.teams:
+            team.member_ids = team_member_ids.get(team.id, [])
         self.logger.info(f"Found {len(env.teams)} teams.")
 
         self.logger.info("Fetching security roles...")
@@ -137,119 +211,253 @@ class DataverseAPIClient:
         env.role_privileges = self.__get_role_read_privileges__(env.security_roles)
         self.logger.info(f"Found {len(env.role_privileges)} read privileges.")
 
-        self.logger.info("Fetching user-role assignments...")
-        env.user_role_assignments = self.__get_user_role_assignments__()
         self.logger.info(
             f"Found user-role assignments for {len(env.user_role_assignments)} users."
         )
 
-        self.logger.info("Fetching team-role assignments...")
-        env.team_role_assignments = self.__get_team_role_assignments__()
         self.logger.info(
             f"Found team-role assignments for {len(env.team_role_assignments)} teams."
         )
 
-        self.logger.info("Fetching team memberships...")
-        self.__populate_team_members__(env.teams)
-
         self.logger.info("Fetching field-level security profiles...")
-        env.field_security_profiles = self.__get_field_security_profiles__()
+        env.field_security_profiles = self.__get_field_security_profiles__(
+            profile_user_ids, profile_team_ids
+        )
         self.logger.info(
             f"Found {len(env.field_security_profiles)} field security profiles."
         )
 
-        # Resolve effective table-level read permissions
-        table_filter = self.__get_table_filter__(source)
-        env.table_permissions = self.__resolve_table_permissions__(env, table_filter)
+        readable_tables = {
+            privilege.entity_name.lower()
+            for privilege in env.role_privileges
+            if privilege.can_read and privilege.entity_name
+        }
+        configured_tables = {
+            str(table).strip().lower()
+            for schema in source.schemas or []
+            for table in schema.tables or []
+            if table
+        }
+        if configured_tables:
+            readable_tables.intersection_update(configured_tables)
+        table_overview = self.__get_table_metadata_overview__(readable_tables)
+        secured_tables = {
+            table_name
+            for table_name, metadata in table_overview.items()
+            if metadata.has_secured_columns
+        }
+        detailed_metadata = {
+            metadata.logical_name: metadata
+            for metadata in self.__get_table_column_metadata__(
+                secured_tables,
+                {
+                    table_name: metadata.ownership_type
+                    for table_name, metadata in table_overview.items()
+                },
+            )
+        }
+        env.table_metadata = [
+            detailed_metadata.get(table_name, metadata)
+            for table_name, metadata in sorted(table_overview.items())
+        ]
+        self.logger.info(
+            "Loaded column metadata for %d CLS-secured tables.",
+            len(env.table_metadata),
+        )
+
+        self.logger.info("Fetching active secured-column masking assignments...")
+        env.attribute_masking_rules = self.__get_attribute_masking_rules__(
+            readable_tables
+        )
+        self.logger.info(
+            "Found %d active masking assignments in the selected table scope.",
+            len(env.attribute_masking_rules),
+        )
+
+        self.logger.info("Fetching record-specific field sharing (POAA)...")
+        env.principal_object_attribute_accesses = (
+            self.__get_principal_object_attribute_accesses__()
+        )
+        self.logger.info(
+            "Found %d readable POAA grants.",
+            len(env.principal_object_attribute_accesses),
+        )
 
         self.logger.debug(
-            f"Dataverse Environment Security Map: {json.dumps(env, default=pydantic_encoder, indent=4)}"
+            "Dataverse security map counts: business_units=%d users=%d teams=%d "
+            "roles=%d privileges=%d field_profiles=%d",
+            len(env.business_units),
+            len(env.users),
+            len(env.teams),
+            len(env.security_roles),
+            len(env.role_privileges),
+            len(env.field_security_profiles),
         )
         return env
 
-    def __get_table_filter__(self, source: Source) -> List[str]:
-        """Build a normalized list of table names from source config for filtering."""
-        tables: List[str] = []
-        if source and source.schemas:
-            for schema in source.schemas:
-                if schema.tables:
-                    for t in schema.tables:
-                        if t:
-                            tables.append(str(t).strip().lower())
-        return tables if tables else None
+    def __get_hierarchy_security_settings__(
+        self,
+    ) -> Tuple[bool, bool, int | None]:
+        url = (
+            f"{self.api_url}/organizations"
+            "?$select=organizationid,ishierarchicalsecuritymodelenabled,"
+            "usepositionhierarchy,maxdepthforhierarchicalsecuritymodel"
+        )
+        records = self._get_paged(url)
+        if len(records) != 1:
+            raise ValueError(
+                "Expected exactly one Dataverse organization security record; "
+                f"received {len(records)}."
+            )
+        record = records[0]
+        if "ishierarchicalsecuritymodelenabled" not in record:
+            raise ValueError(
+                "Dataverse organization response omitted hierarchy security state."
+            )
+        return (
+            bool(record["ishierarchicalsecuritymodelenabled"]),
+            bool(record.get("usepositionhierarchy", False)),
+            record.get("maxdepthforhierarchicalsecuritymodel"),
+        )
 
-    def __get_users__(self) -> List[DataverseUser]:
-        """Retrieve active (non-disabled) system users."""
+    def __get_users_and_relationships__(
+        self,
+    ) -> Tuple[
+        List[DataverseUser],
+        Dict[str, List[str]],
+        Dict[str, List[str]],
+        Dict[str, List[str]],
+    ]:
+        """Retrieve active users with roles, teams, and field security profiles."""
         url = (
             f"{self.api_url}/systemusers"
-            "?$select=systemuserid,fullname,internalemailaddress,azureactivedirectoryobjectid,isdisabled,_businessunitid_value"
+            "?$select=systemuserid,fullname,internalemailaddress,"
+            "azureactivedirectoryobjectid,applicationid,isdisabled,accessmode,"
+            "islicensed,azurestate,_businessunitid_value"
+            "&$expand=systemuserroles_association($select=roleid),"
+            "teammembership_association($select=teamid),"
+            "systemuserprofiles_association($select=fieldsecurityprofileid)"
             "&$filter=isdisabled eq false"
         )
         records = self._get_paged(url)
-        users = []
-        for r in records:
-            email = r.get("internalemailaddress", "")
+        users: List[DataverseUser] = []
+        role_assignments: Dict[str, List[str]] = {}
+        team_member_ids: Dict[str, set] = {}
+        profile_user_ids: Dict[str, set] = {}
+
+        for record in records:
+            user_id = record["systemuserid"]
             users.append(
                 DataverseUser(
-                    id=r["systemuserid"],
-                    name=r.get("fullname"),
-                    email=email,
-                    azure_ad_object_id=r.get("azureactivedirectoryobjectid"),
-                    business_unit_id=r.get("_businessunitid_value"),
-                    is_disabled=r.get("isdisabled", False),
+                    id=user_id,
+                    name=record.get("fullname"),
+                    email=record.get("internalemailaddress", ""),
+                    azure_ad_object_id=self._normalize_optional_guid(
+                        record.get("azureactivedirectoryobjectid")
+                    ),
+                    application_id=self._normalize_optional_guid(
+                        record.get("applicationid")
+                    ),
+                    business_unit_id=record.get("_businessunitid_value"),
+                    is_disabled=record.get("isdisabled", False),
+                    access_mode=record.get("accessmode", 0),
+                    is_licensed=record.get("islicensed", True),
+                    azure_state=record.get("azurestate"),
                 )
             )
-        self.logger.debug(
-            f"Dataverse Users: {json.dumps(users, default=pydantic_encoder, indent=4)}"
-        )
-        return users
 
-    def __get_teams__(self) -> List[DataverseTeam]:
-        """Retrieve teams from Dataverse."""
+            role_ids = {
+                role.get("roleid")
+                for role in self._get_expanded_collection(
+                    record, "systemuserroles_association"
+                )
+                if role.get("roleid")
+            }
+            if role_ids:
+                role_assignments[user_id] = sorted(role_ids)
+
+            for team in self._get_expanded_collection(
+                record, "teammembership_association"
+            ):
+                team_id = team.get("teamid")
+                if team_id:
+                    team_member_ids.setdefault(team_id, set()).add(user_id)
+
+            for profile in self._get_expanded_collection(
+                record, "systemuserprofiles_association"
+            ):
+                profile_id = profile.get("fieldsecurityprofileid")
+                if profile_id:
+                    profile_user_ids.setdefault(profile_id, set()).add(user_id)
+
+        self.logger.debug("Mapped %d active Dataverse users.", len(users))
+        return (
+            users,
+            role_assignments,
+            {team_id: sorted(ids) for team_id, ids in team_member_ids.items()},
+            {profile_id: sorted(ids) for profile_id, ids in profile_user_ids.items()},
+        )
+
+    def __get_teams_and_relationships__(
+        self,
+    ) -> Tuple[List[DataverseTeam], Dict[str, List[str]], Dict[str, List[str]]]:
+        """Retrieve teams with role and field security profile assignments."""
         url = (
             f"{self.api_url}/teams"
-            "?$select=teamid,name,teamtype,azureactivedirectoryobjectid,_businessunitid_value"
+            "?$select=teamid,name,teamtype,membershiptype,"
+            "azureactivedirectoryobjectid,_businessunitid_value"
+            "&$expand=teamroles_association($select=roleid),"
+            "teamprofiles_association($select=fieldsecurityprofileid)"
         )
         records = self._get_paged(url)
-        teams = [
-            DataverseTeam(
-                id=r["teamid"],
-                name=r.get("name"),
-                team_type=r.get("teamtype", 0),
-                azure_ad_object_id=r.get("azureactivedirectoryobjectid"),
-                business_unit_id=r.get("_businessunitid_value"),
-            )
-            for r in records
-        ]
-        self.logger.debug(
-            f"Dataverse Teams: {json.dumps(teams, default=pydantic_encoder, indent=4)}"
-        )
-        return teams
+        teams: List[DataverseTeam] = []
+        role_assignments: Dict[str, List[str]] = {}
+        profile_team_ids: Dict[str, set] = {}
 
-    def __populate_team_members__(self, teams: List[DataverseTeam]) -> None:
-        """Populate member_ids for each team via teammemberships."""
-        for team in teams:
-            url = f"{self.api_url}/teams({team.id})/teammembership_association/$ref"
-            try:
-                records = self._get_paged(url)
-                member_ids = []
-                for r in records:
-                    ref = r.get("@odata.id", "")
-                    if "systemusers(" in ref:
-                        uid = ref.split("systemusers(")[1].rstrip(")")
-                        member_ids.append(uid)
-                team.member_ids = member_ids
-            except Exception as e:
-                self.logger.warning(
-                    f"Failed to fetch members for team {team.name}: {e}"
+        for record in records:
+            team_id = record["teamid"]
+            teams.append(
+                DataverseTeam(
+                    id=team_id,
+                    name=record.get("name"),
+                    team_type=record.get("teamtype", 0),
+                    azure_ad_object_id=self._normalize_optional_guid(
+                        record.get("azureactivedirectoryobjectid")
+                    ),
+                    business_unit_id=record.get("_businessunitid_value"),
+                    membership_type=record.get("membershiptype", 0),
                 )
-                team.member_ids = []
+            )
+
+            role_ids = {
+                role.get("roleid")
+                for role in self._get_expanded_collection(
+                    record, "teamroles_association"
+                )
+                if role.get("roleid")
+            }
+            if role_ids:
+                role_assignments[team_id] = sorted(role_ids)
+
+            for profile in self._get_expanded_collection(
+                record, "teamprofiles_association"
+            ):
+                profile_id = profile.get("fieldsecurityprofileid")
+                if profile_id:
+                    profile_team_ids.setdefault(profile_id, set()).add(team_id)
+
+        self.logger.debug("Mapped %d Dataverse teams.", len(teams))
+        return (
+            teams,
+            role_assignments,
+            {profile_id: sorted(ids) for profile_id, ids in profile_team_ids.items()},
+        )
 
     def __get_security_roles__(self) -> List[DataverseSecurityRole]:
         """Retrieve all published security roles (componentstate=0)."""
         url = (
             f"{self.api_url}/roles"
-            "?$select=roleid,name,_businessunitid_value"
+            "?$select=roleid,name,_businessunitid_value,_parentrootroleid_value,isinherited"
             "&$filter=componentstate eq 0"
         )
         records = self._get_paged(url)
@@ -258,20 +466,20 @@ class DataverseAPIClient:
                 id=r["roleid"],
                 name=r.get("name"),
                 business_unit_id=r.get("_businessunitid_value"),
+                parent_root_role_id=r.get("_parentrootroleid_value"),
+                is_inherited=r.get("isinherited"),
             )
             for r in records
         ]
-        self.logger.debug(
-            f"Dataverse Security Roles: {json.dumps(roles, default=pydantic_encoder, indent=4)}"
-        )
+        self.logger.debug("Mapped %d published Dataverse security roles.", len(roles))
         return roles
 
     def __get_business_units__(self) -> List[DataverseBusinessUnit]:
         """Retrieve all business units and hierarchy relations."""
         url = (
             f"{self.api_url}/businessunits"
-            "?$select=businessunitid,name,_parentbusinessunitid_value"
-            "&$filter=isdisabled eq false"
+            "?$select=businessunitid,name,_parentbusinessunitid_value,isdisabled,"
+            "createdon,modifiedon"
         )
         records = self._get_paged(url)
         return [
@@ -279,6 +487,9 @@ class DataverseAPIClient:
                 id=r.get("businessunitid"),
                 name=r.get("name"),
                 parent_business_unit_id=r.get("_parentbusinessunitid_value"),
+                is_disabled=r.get("isdisabled", False),
+                created_on=r.get("createdon"),
+                modified_on=r.get("modifiedon"),
             )
             for r in records
             if r.get("businessunitid")
@@ -289,8 +500,9 @@ class DataverseAPIClient:
     ) -> List[DataverseRolePrivilege]:
         """
         Retrieve role privileges and filter to only read-related privileges.
-        Uses roleprivileges_association for privilege metadata and
-        roleprivilegescollection for the privilege depth mask (bitmask values).
+        Joins roleprivilegescollection depth assignments to the global privileges
+        collection so extraction uses two paginated queries instead of one query
+        per role.
         """
         # Dataverse privilegedepthmask uses bitmask values, not ordinals.
         DEPTH_MASK_MAP = {
@@ -300,268 +512,327 @@ class DataverseAPIClient:
             8: "Global",  # Organization 2^3
         }
 
-        # Build a depth lookup from roleprivilegescollection (the intersect entity
-        # that holds privilegedepthmask). Keyed by (roleid, privilegeid).
-        # Convert bitmask -> named depth at lookup-build time.
-        depth_lookup: Dict[tuple, str] = {}
+        role_ids = {role.id for role in roles if role.id}
+        root_role_ids = {
+            role.parent_root_role_id or role.id for role in roles if role.id
+        }
         depth_url = (
             f"{self.api_url}/roleprivilegescollection"
-            "?$select=roleid,privilegeid,privilegedepthmask"
+            "?$select=roleid,privilegeid,privilegedepthmask,"
+            "_recordfilterid_value"
             "&$filter=componentstate eq 0"
         )
         depth_records = self._get_paged(depth_url)
-        for dr in depth_records:
-            key = (dr.get("roleid", ""), dr.get("privilegeid", ""))
-            raw_mask = dr.get("privilegedepthmask")
-            if raw_mask is not None and raw_mask in DEPTH_MASK_MAP:
-                depth_lookup[key] = DEPTH_MASK_MAP[raw_mask]
-            else:
-                self.logger.warning(
-                    f"Missing or unrecognized privilegedepthmask={raw_mask} "
-                    f"for role={key[0][:12]} privilege={key[1][:12]}. "
-                    f"Treating as Unknown (fail-closed)."
-                )
-                depth_lookup[key] = "Unknown"
 
-        all_privileges = []
+        privilege_url = (
+            f"{self.api_url}/privileges?$select=privilegeid,name,accessright"
+        )
+        privilege_records = self._get_paged(privilege_url)
+        privilege_by_id = {
+            privilege.get("privilegeid"): privilege
+            for privilege in privilege_records
+            if privilege.get("privilegeid")
+        }
 
-        for role in roles:
-            url = (
-                f"{self.api_url}/roles({role.id})/roleprivileges_association"
-                "?$select=privilegeid,name,accessright"
-            )
-            try:
-                records = self._get_paged(url)
-            except Exception as e:
-                self.logger.warning(
-                    f"Failed to fetch privileges for role {role.name}: {e}"
-                )
+        depth_records_by_role: Dict[str, List[dict]] = {}
+        for depth_record in depth_records:
+            role_id = depth_record.get("roleid", "")
+            if role_id not in role_ids and role_id not in root_role_ids:
                 continue
+            depth_records_by_role.setdefault(role_id, []).append(depth_record)
 
-            for r in records:
-                priv_name = r.get("name", "")
-                access_right = r.get("accessright", 0)
+        all_privileges: List[DataverseRolePrivilege] = []
+        for role in roles:
+            if not role.id:
+                continue
+            privilege_source_role_id = role.parent_root_role_id or role.id
+            for depth_record in depth_records_by_role.get(privilege_source_role_id, []):
+                privilege_id = depth_record.get("privilegeid", "")
 
-                # Filter to read privileges: name starts with 'prvRead' or accessright includes ReadAccess bit
-                is_read = priv_name.lower().startswith(
+                privilege = privilege_by_id.get(privilege_id)
+                if not privilege:
+                    raise ValueError(
+                        "Dataverse role privilege metadata join is incomplete. "
+                        "No policies were generated."
+                    )
+                    continue
+
+                privilege_name = privilege.get("name", "")
+                access_right = privilege.get("accessright", 0)
+                is_read = privilege_name.lower().startswith(
                     self.READ_PRIVILEGE_PREFIX.lower()
                 )
                 if not is_read and not (access_right & self.READ_ACCESS_RIGHT):
                     continue
 
-                # Extract entity name from privilege name (e.g., 'prvReadaccount' -> 'account')
                 entity_name = None
-                if priv_name.lower().startswith("prvread"):
-                    entity_name = priv_name[7:].lower()  # len("prvRead") = 7
+                if privilege_name.lower().startswith("prvread"):
+                    entity_name = privilege_name[7:].lower()
 
-                # Resolve depth from roleprivilegescollection intersect entity.
-                # If not found in depth_lookup, fail-closed with Unknown.
-                priv_id = r.get("privilegeid", "")
-                depth = depth_lookup.get((role.id, priv_id))
-                if depth is None:
+                raw_mask = depth_record.get("privilegedepthmask")
+                depth = DEPTH_MASK_MAP.get(raw_mask, "Unknown")
+                if depth == "Unknown":
                     self.logger.warning(
-                        f"No depth found in roleprivilegescollection for "
-                        f"role={role.id[:12]} privilege={priv_id[:12]} ({priv_name}). "
+                        f"Missing or unrecognized privilegedepthmask={raw_mask} "
+                        f"for role={role.id[:12]} privilege={privilege_id[:12]}. "
                         f"Treating as Unknown (fail-closed)."
                     )
-                    depth = "Unknown"
 
                 all_privileges.append(
                     DataverseRolePrivilege(
-                        privilege_id=r["privilegeid"],
+                        privilege_id=privilege_id,
                         role_id=role.id,
-                        name=priv_name,
+                        name=privilege_name,
                         access_right=access_right,
                         depth=depth,
                         entity_name=entity_name,
                         can_read=True,
+                        record_filter_id=depth_record.get("_recordfilterid_value"),
                     )
                 )
 
         return all_privileges
 
-    def __get_user_role_assignments__(self) -> Dict[str, List[str]]:
-        """
-        Get mapping of user IDs to their assigned security role IDs.
-        Uses systemuserroles_association navigation property.
-        """
-        url = (
-            f"{self.api_url}/systemusers"
-            "?$select=systemuserid"
-            "&$expand=systemuserroles_association($select=roleid)"
-            "&$filter=isdisabled eq false"
-        )
-        records = self._get_paged(url)
-        assignments: Dict[str, List[str]] = {}
-        for r in records:
-            user_id = r.get("systemuserid")
-            roles = r.get("systemuserroles_association", [])
-            role_ids = [x.get("roleid") for x in roles if x.get("roleid")]
-            if user_id and role_ids:
-                assignments[user_id] = role_ids
-
-        self.logger.debug(f"User-Role Assignments: {len(assignments)} users mapped")
-        return assignments
-
-    def __get_team_role_assignments__(self) -> Dict[str, List[str]]:
-        """
-        Get mapping of team IDs to their assigned security role IDs.
-        Uses teamroles_association navigation property.
-        """
-        url = (
-            f"{self.api_url}/teams"
-            "?$select=teamid"
-            "&$expand=teamroles_association($select=roleid)"
-        )
-        records = self._get_paged(url)
-        assignments: Dict[str, List[str]] = {}
-        for r in records:
-            team_id = r.get("teamid")
-            roles = r.get("teamroles_association", [])
-            role_ids = [x.get("roleid") for x in roles if x.get("roleid")]
-            if team_id and role_ids:
-                assignments[team_id] = role_ids
-
-        self.logger.debug(f"Team-Role Assignments: {len(assignments)} teams mapped")
-        return assignments
-
-    def __get_field_security_profiles__(self) -> List[DataverseFieldSecurityProfile]:
-        """Retrieve field-level security profiles, their field permissions, and assignments."""
+    def __get_field_security_profiles__(
+        self,
+        profile_user_ids: Dict[str, List[str]],
+        profile_team_ids: Dict[str, List[str]],
+    ) -> List[DataverseFieldSecurityProfile]:
+        """Retrieve field profiles and join bulk permissions and assignments."""
         url = (
             f"{self.api_url}/fieldsecurityprofiles?$select=fieldsecurityprofileid,name"
         )
         records = self._get_paged(url)
-        profiles = []
-
-        for r in records:
-            profile_id = r["fieldsecurityprofileid"]
-            profile = DataverseFieldSecurityProfile(
-                id=profile_id,
-                name=r.get("name"),
+        profiles = [
+            DataverseFieldSecurityProfile(
+                id=record["fieldsecurityprofileid"],
+                name=record.get("name"),
+                user_ids=profile_user_ids.get(record["fieldsecurityprofileid"], []),
+                team_ids=profile_team_ids.get(record["fieldsecurityprofileid"], []),
             )
+            for record in records
+        ]
+        profile_by_id = {profile.id: profile for profile in profiles}
 
-            # Get field permissions for this profile
-            perm_url = (
-                f"{self.api_url}/fieldpermissions"
-                f"?$select=fieldpermissionid,entityname,attributelogicalname,canread"
-                f"&$filter=_fieldsecurityprofileid_value eq {profile_id}"
+        permission_url = (
+            f"{self.api_url}/fieldpermissions"
+            "?$select=fieldpermissionid,_fieldsecurityprofileid_value,"
+            "entityname,attributelogicalname,canread"
+            "&$filter=componentstate eq 0"
+        )
+        permission_records = self._get_paged(permission_url)
+        for record in permission_records:
+            profile_id = record.get("_fieldsecurityprofileid_value")
+            profile = profile_by_id.get(profile_id)
+            if not profile:
+                continue
+            profile.permissions.append(
+                DataverseFieldPermission(
+                    field_security_profile_id=profile_id,
+                    field_security_profile_name=profile.name,
+                    entity_name=record.get("entityname"),
+                    attribute_logical_name=record.get("attributelogicalname"),
+                    can_read=record.get("canread", 0),
+                )
             )
-            try:
-                perm_records = self._get_paged(perm_url)
-                profile.permissions = [
-                    DataverseFieldPermission(
-                        field_security_profile_id=profile_id,
-                        field_security_profile_name=profile.name,
-                        entity_name=p.get("entityname"),
-                        attribute_logical_name=p.get("attributelogicalname"),
-                        can_read=p.get("canread", 0),
-                    )
-                    for p in perm_records
-                ]
-            except Exception as e:
-                self.logger.warning(
-                    f"Failed to fetch field permissions for profile {profile.name}: {e}"
-                )
-
-            # Get users assigned to this profile
-            user_url = f"{self.api_url}/fieldsecurityprofiles({profile_id})/systemuserprofiles_association/$ref"
-            try:
-                user_records = self._get_paged(user_url)
-                profile.user_ids = [
-                    ref.get("@odata.id", "").split("systemusers(")[1].rstrip(")")
-                    for ref in user_records
-                    if "systemusers(" in ref.get("@odata.id", "")
-                ]
-            except Exception as e:
-                self.logger.warning(
-                    f"Failed to fetch user assignments for profile {profile.name}: {e}"
-                )
-
-            # Get teams assigned to this profile
-            team_url = f"{self.api_url}/fieldsecurityprofiles({profile_id})/teamprofiles_association/$ref"
-            try:
-                team_records = self._get_paged(team_url)
-                profile.team_ids = [
-                    ref.get("@odata.id", "").split("teams(")[1].rstrip(")")
-                    for ref in team_records
-                    if "teams(" in ref.get("@odata.id", "")
-                ]
-            except Exception as e:
-                self.logger.warning(
-                    f"Failed to fetch team assignments for profile {profile.name}: {e}"
-                )
-
-            profiles.append(profile)
 
         return profiles
 
-    def __resolve_table_permissions__(
-        self, env: DataverseEnvironment, table_filter: List[str]
-    ) -> List[DataverseTablePermission]:
-        """
-        Resolve effective table-level read permissions for all principals.
-        Combines user direct role assignments + team role assignments
-        to determine which users/teams can read which tables.
-        """
-        permissions = []
-        role_entity_map = self.__build_role_entity_map__(
-            env.role_privileges, env.security_roles
+    def __get_table_column_metadata__(
+        self,
+        table_names: set[str],
+        ownership_by_table: Dict[str, str] | None = None,
+    ) -> List[DataverseTableMetadata]:
+        metadata = []
+        for table_name in sorted(table_names):
+            if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
+                raise ValueError(
+                    f"Invalid Dataverse table logical name in field metadata: {table_name}"
+                )
+            url = (
+                f"{self.api_url}/EntityDefinitions(LogicalName='{table_name}')/"
+                "Attributes?$select=MetadataId,LogicalName,IsSecured,IsValidForRead"
+            )
+            records = self._get_paged(url)
+            required_fields = {
+                "MetadataId",
+                "LogicalName",
+                "IsSecured",
+                "IsValidForRead",
+            }
+            if any(
+                not isinstance(record, dict)
+                or not required_fields.issubset(record)
+                or not isinstance(record["MetadataId"], str)
+                or not record["MetadataId"]
+                or not isinstance(record["LogicalName"], str)
+                or not record["LogicalName"]
+                or not isinstance(record["IsSecured"], bool)
+                or not isinstance(record["IsValidForRead"], bool)
+                for record in records
+            ):
+                raise ValueError(
+                    f"Dataverse column metadata for '{table_name}' is incomplete."
+                )
+            columns = [
+                DataverseColumnMetadata(
+                    metadata_id=record.get("MetadataId"),
+                    logical_name=record.get("LogicalName"),
+                    is_secured=record.get("IsSecured", False),
+                )
+                for record in records
+                if record.get("LogicalName") and record.get("IsValidForRead", True)
+            ]
+            if not columns:
+                raise ValueError(
+                    f"No readable column metadata returned for Dataverse table "
+                    f"'{table_name}'."
+                )
+            metadata.append(
+                DataverseTableMetadata(
+                    logical_name=table_name,
+                    ownership_type=(ownership_by_table or {}).get(table_name),
+                    has_secured_columns=True,
+                    columns=columns,
+                )
+            )
+        return metadata
+
+    def __get_table_metadata_overview__(
+        self, candidates: set[str]
+    ) -> Dict[str, DataverseTableMetadata]:
+        if not candidates:
+            return {}
+        url = (
+            f"{self.api_url}/EntityDefinitions?$select=LogicalName,OwnershipType&$expand="
+            "Attributes($select=MetadataId,LogicalName,IsSecured,IsValidForRead;"
+            "$filter=IsSecured eq true)"
         )
-        table_filter_set = set(table_filter) if table_filter else None
-
-        # User direct role assignments
-        for user_id, role_ids in env.user_role_assignments.items():
-            user = env.lookup_user_by_id(user_id)
-            if not user:
+        metadata_by_table: Dict[str, DataverseTableMetadata] = {}
+        for record in self._get_paged(url):
+            logical_name = str(record.get("LogicalName") or "").lower()
+            if logical_name not in candidates:
                 continue
-            for role_id in role_ids:
-                if role_id not in role_entity_map:
-                    continue
-                role_name, role_business_unit_id, entities = role_entity_map[role_id]
-                for entity_name, depth in entities.items():
-                    if table_filter_set and entity_name.lower() not in table_filter_set:
-                        continue
-                    permissions.append(
-                        DataverseTablePermission(
-                            table_name=entity_name,
-                            principal_id=user_id,
-                            principal_type=IamType.USER,
-                            principal_business_unit_id=user.business_unit_id,
-                            has_read=True,
-                            depth=depth,
-                            role_id=role_id,
-                            role_name=role_name,
-                            role_business_unit_id=role_business_unit_id,
-                        )
-                    )
+            if "Attributes" not in record:
+                raise ValueError(
+                    f"Dataverse table metadata for '{logical_name}' omitted the "
+                    "expanded Attributes collection."
+                )
+            if record["Attributes"] is None:
+                raise ValueError(
+                    f"Dataverse table metadata for '{logical_name}' returned a null "
+                    "Attributes collection."
+                )
+            if logical_name in metadata_by_table:
+                raise ValueError(
+                    f"Dataverse table metadata returned duplicate rows for "
+                    f"'{logical_name}'."
+                )
+            secured_attributes = self._get_expanded_collection(record, "Attributes")
+            required_fields = {
+                "MetadataId",
+                "LogicalName",
+                "IsSecured",
+                "IsValidForRead",
+            }
+            if any(
+                not isinstance(attribute, dict)
+                or not required_fields.issubset(attribute)
+                or not isinstance(attribute["MetadataId"], str)
+                or not attribute["MetadataId"]
+                or not isinstance(attribute["LogicalName"], str)
+                or not attribute["LogicalName"]
+                or attribute["IsSecured"] is not True
+                or not isinstance(attribute["IsValidForRead"], bool)
+                for attribute in secured_attributes
+            ):
+                raise ValueError(
+                    f"Dataverse table metadata for '{logical_name}' contains an "
+                    "incomplete attribute record."
+                )
+            metadata_by_table[logical_name] = DataverseTableMetadata(
+                logical_name=logical_name,
+                ownership_type=record.get("OwnershipType"),
+                has_secured_columns=any(
+                    attribute.get("LogicalName")
+                    and attribute.get("IsSecured")
+                    and attribute.get("IsValidForRead", True)
+                    for attribute in secured_attributes
+                ),
+            )
+        return metadata_by_table
 
-        # Team role assignments
-        for team_id, role_ids in env.team_role_assignments.items():
-            team = env.lookup_team_by_id(team_id)
-            if not team:
-                continue
-            for role_id in role_ids:
-                if role_id not in role_entity_map:
-                    continue
-                role_name, role_business_unit_id, entities = role_entity_map[role_id]
-                for entity_name, depth in entities.items():
-                    if table_filter_set and entity_name.lower() not in table_filter_set:
-                        continue
-                    permissions.append(
-                        DataverseTablePermission(
-                            table_name=entity_name,
-                            principal_id=team_id,
-                            principal_type=IamType.GROUP,
-                            principal_business_unit_id=team.business_unit_id,
-                            has_read=True,
-                            depth=depth,
-                            role_id=role_id,
-                            role_name=role_name,
-                            role_business_unit_id=role_business_unit_id,
-                        )
-                    )
+    def __get_secured_table_names__(self, candidates: set[str]) -> set[str]:
+        return {
+            table_name
+            for table_name, metadata in self.__get_table_metadata_overview__(
+                candidates
+            ).items()
+            if metadata.has_secured_columns
+        }
 
-        return permissions
+    def __get_principal_object_attribute_accesses__(
+        self,
+    ) -> List[DataversePrincipalObjectAttributeAccess]:
+        url = (
+            f"{self.api_url}/principalobjectattributeaccessset"
+            "?$select=principalobjectattributeaccessid,attributeid,"
+            "readaccess,_objectid_value,"
+            "_principalid_value&$filter=readaccess eq true"
+        )
+        return [
+            DataversePrincipalObjectAttributeAccess(
+                id=record.get("principalobjectattributeaccessid"),
+                attribute_id=record.get("attributeid"),
+                object_id=record.get("_objectid_value"),
+                object_type_code=record.get(
+                    "_objectid_value@Microsoft.Dynamics.CRM.lookuplogicalname"
+                ),
+                principal_id=record.get("_principalid_value"),
+                principal_type=record.get(
+                    "_principalid_value@Microsoft.Dynamics.CRM.lookuplogicalname"
+                ),
+                read_access=record.get("readaccess", False),
+            )
+            for record in self._get_paged(url)
+            if record.get("readaccess")
+        ]
+
+    def __get_attribute_masking_rules__(
+        self, table_names: set[str]
+    ) -> List[DataverseAttributeMaskingRule]:
+        if not table_names:
+            return []
+        url = (
+            f"{self.api_url}/attributemaskingrules"
+            "?$select=attributemaskingruleid,entityname,attributelogicalname,"
+            "_maskingruleid_value&$filter=componentstate eq 0"
+        )
+        records = self._get_paged(url)
+        required_fields = {
+            "attributemaskingruleid",
+            "entityname",
+            "attributelogicalname",
+            "_maskingruleid_value",
+        }
+        if any(
+            not isinstance(record, dict)
+            or not required_fields.issubset(record)
+            or not all(record.get(field) for field in required_fields)
+            for record in records
+        ):
+            raise ValueError("Dataverse masking assignment metadata is incomplete.")
+        selected_tables = {table_name.casefold() for table_name in table_names}
+        return [
+            DataverseAttributeMaskingRule(
+                id=record["attributemaskingruleid"],
+                entity_name=record["entityname"],
+                attribute_logical_name=record["attributelogicalname"],
+                masking_rule_id=record["_maskingruleid_value"],
+            )
+            for record in records
+            if record["entityname"].casefold() in selected_tables
+        ]
 
     def __build_role_entity_map__(
         self,

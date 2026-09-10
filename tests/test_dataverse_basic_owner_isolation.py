@@ -175,11 +175,19 @@ class TestBasicDepthTwoDirectUsers(unittest.TestCase):
         self.assertIn("user-B", filt)
         self.assertNotIn("user-A", filt)
 
-    def test_role_names_include_principal_identity(self) -> None:
+    def test_role_names_use_stable_non_pii_principal_identity(self) -> None:
         export = _build_export(self.env)
         names = {p.name for p in export.policies}
-        self.assertTrue(any("alice@example.com" in n for n in names))
-        self.assertTrue(any("bob@example.com" in n for n in names))
+        self.assertEqual(2, len(names))
+        self.assertTrue(all("Principal" in name for name in names))
+        self.assertTrue(all("@" not in name for name in names))
+
+        changed_email_environment = self.env.model_copy(deep=True)
+        changed_email_environment.users[0].email = "changed@example.com"
+        changed_names = {
+            policy.name for policy in _build_export(changed_email_environment).policies
+        }
+        self.assertEqual(names, changed_names)
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +387,160 @@ class TestBasicDepthOwnerTeam(unittest.TestCase):
         self.assertNotIn("user-B", filt)
 
 
+class TestBasicDepthTeamPrivilegesOnly(unittest.TestCase):
+    def test_team_inherited_basic_excludes_personal_owner(self) -> None:
+        environment = DataverseEnvironment(
+            users=[
+                DataverseUser(
+                    id="user-A",
+                    email="alice@example.com",
+                    azure_ad_object_id="entra-A",
+                )
+            ],
+            teams=[
+                DataverseTeam(
+                    id="team-O",
+                    name="Owner Team",
+                    team_type=0,
+                    member_ids=["user-A"],
+                )
+            ],
+            security_roles=[
+                DataverseSecurityRole(
+                    id="role-1",
+                    name="Team Reader",
+                    business_unit_id="bu-root",
+                    is_inherited=0,
+                )
+            ],
+            team_role_assignments={"team-O": ["role-1"]},
+            table_permissions=[
+                DataverseTablePermission(
+                    table_name="incident",
+                    principal_id="team-O",
+                    principal_type=IamType.GROUP,
+                    has_read=True,
+                    depth="Basic",
+                    role_id="role-1",
+                    role_name="Team Reader",
+                    role_business_unit_id="bu-root",
+                )
+            ],
+        )
+
+        export = _build_export(environment)
+
+        self.assertEqual(
+            "ownerid in ('team-O')",
+            export.policies[0].rowconstraints[0].filter_condition,
+        )
+
+
+class TestInheritedTeamRoleDirectBasicOverlay(unittest.TestCase):
+    def _build_environment(self, depth: str, is_inherited: int) -> DataverseEnvironment:
+        return DataverseEnvironment(
+            users=[
+                DataverseUser(
+                    id="user-A",
+                    email="alice@example.com",
+                    azure_ad_object_id="entra-A",
+                    business_unit_id="bu-other",
+                )
+            ],
+            teams=[
+                DataverseTeam(
+                    id="team-O",
+                    name="Owner Team",
+                    team_type=0,
+                    business_unit_id="bu-root",
+                    member_ids=["user-A"],
+                )
+            ],
+            business_units=[
+                DataverseBusinessUnit(id="bu-root", name="Root"),
+                DataverseBusinessUnit(
+                    id="bu-child",
+                    name="Child",
+                    parent_business_unit_id="bu-root",
+                ),
+                DataverseBusinessUnit(id="bu-other", name="Other"),
+            ],
+            security_roles=[
+                DataverseSecurityRole(
+                    id="role-1",
+                    name="Team Reader",
+                    business_unit_id="bu-root",
+                    is_inherited=is_inherited,
+                )
+            ],
+            team_role_assignments={"team-O": ["role-1"]},
+            table_permissions=[
+                DataverseTablePermission(
+                    table_name="incident",
+                    principal_id="team-O",
+                    principal_type=IamType.GROUP,
+                    has_read=True,
+                    depth=depth,
+                    role_id="role-1",
+                    role_name="Team Reader",
+                    role_business_unit_id="bu-root",
+                )
+            ],
+        )
+
+    def test_local_team_role_with_direct_inheritance_includes_personal_rows(
+        self,
+    ) -> None:
+        export = _build_export(self._build_environment("Local", 1))
+
+        self.assertEqual(1, len(export.policies))
+        condition = export.policies[0].rowconstraints[0].filter_condition
+        self.assertIn("owningbusinessunit = 'bu-root'", condition)
+        self.assertIn("ownerid", condition)
+        self.assertIn("user-A", condition)
+        self.assertIn("team-O", condition)
+
+    def test_deep_team_role_with_direct_inheritance_includes_personal_rows(
+        self,
+    ) -> None:
+        export = _build_export(self._build_environment("Deep", 1))
+
+        self.assertEqual(1, len(export.policies))
+        condition = export.policies[0].rowconstraints[0].filter_condition
+        self.assertIn("owningbusinessunit", condition)
+        self.assertIn("bu-child", condition)
+        self.assertIn("ownerid", condition)
+        self.assertIn("user-A", condition)
+
+    def test_local_team_only_role_excludes_personal_owner_predicate(self) -> None:
+        export = _build_export(self._build_environment("Local", 0))
+
+        condition = export.policies[0].rowconstraints[0].filter_condition
+        self.assertEqual("owningbusinessunit = 'bu-root'", condition)
+
+    def test_local_inherited_role_stays_shared_when_ownership_is_in_scope(self) -> None:
+        environment = self._build_environment("Local", 1)
+        environment.users[0].business_unit_id = "bu-root"
+        environment.users.append(
+            DataverseUser(
+                id="user-B",
+                email="bob@example.com",
+                azure_ad_object_id="entra-B",
+                business_unit_id="bu-root",
+            )
+        )
+        environment.teams[0].member_ids.append("user-B")
+
+        export = _build_export(environment)
+
+        self.assertEqual(1, len(export.policies))
+        self.assertEqual(2, len(export.policies[0].permissionobjects))
+        self.assertEqual(
+            "owningbusinessunit = 'bu-root'",
+            export.policies[0].rowconstraints[0].filter_condition,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Single user → no split needed, but still per-principal
 # ---------------------------------------------------------------------------
@@ -435,7 +597,30 @@ class TestBasicDepthSingleUser(unittest.TestCase):
     def test_filter_contains_only_owner(self) -> None:
         export = _build_export(self.env)
         filt = export.policies[0].rowconstraints[0].filter_condition
-        self.assertEqual(filt, "_ownerid_value in ('user-A')")
+        self.assertEqual(filt, "ownerid in ('user-A')")
+
+    def test_direct_basic_includes_all_owner_team_memberships(self) -> None:
+        self.env.teams = [
+            DataverseTeam(
+                id="owner-team",
+                name="Owner Team",
+                team_type=0,
+                member_ids=["user-A"],
+            ),
+            DataverseTeam(
+                id="access-team",
+                name="Access Team",
+                team_type=1,
+                member_ids=["user-A"],
+            ),
+        ]
+
+        export = _build_export(self.env)
+        filt = export.policies[0].rowconstraints[0].filter_condition
+
+        self.assertIn("user-A", filt)
+        self.assertIn("owner-team", filt)
+        self.assertNotIn("access-team", filt)
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +704,33 @@ class TestNonBasicDepthNotSplit(unittest.TestCase):
         export = _build_export(self._make_env("Deep"))
         self.assertEqual(len(export.policies), 1)
         self.assertEqual(len(export.policies[0].permissionobjects), 2)
+
+    def test_direct_local_adds_cross_bu_owner_team_scope(self) -> None:
+        environment = self._make_env("Local")
+        environment.teams = [
+            DataverseTeam(
+                id="cross-bu-team",
+                name="Cross BU Owner Team",
+                team_type=0,
+                business_unit_id="bu-other",
+                member_ids=["user-A"],
+            )
+        ]
+        environment.business_units.append(
+            DataverseBusinessUnit(id="bu-other", name="Other")
+        )
+
+        export = _build_export(environment)
+        alice_policy = next(
+            policy
+            for policy in export.policies
+            if policy.permissionobjects[0].entra_object_id == "entra-A"
+        )
+        condition = alice_policy.rowconstraints[0].filter_condition
+
+        self.assertIn("owningbusinessunit = 'bu-root'", condition)
+        self.assertIn("cross-bu-team", condition)
+        self.assertIn("user-A", condition)
 
 
 # ---------------------------------------------------------------------------
